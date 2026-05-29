@@ -1,4 +1,11 @@
 #!/bin/bash
+
+# Prevent macOS from sleeping and terminating the session during setup
+if [[ -z "$CAFFEINATED" ]]; then
+    export CAFFEINATED=1
+    exec caffeinate -i "$0" "$@"
+fi
+
 # ==============================================================================
 # Script Name: Cisco AnyConnect Touch ID CLI Setup
 # Description: Automated setup wizard for a secure, Touch ID-enabled, and 
@@ -151,12 +158,13 @@ echo ""
 
 # --- 2. GPG Key Check ---
 echo -e "${BOLD}Configuring Encryption...${NC}"
-if ! gpg --list-secret-keys &> /dev/null; then
+while ! gpg --list-secret-keys 2>/dev/null | grep -q "^sec"; do
     echo -e "${YELLOW}No GPG secret key found.${NC}"
-    echo "You need a GPG key pair to securely store your credentials."
-    read -p "Press Enter to generate one now (follow the prompts), or Ctrl+C to cancel..."
-    gpg --full-generate-key
-fi
+    echo "You need to set up GPG before continuing. Run the following command in a new terminal window:"
+    echo -e "  ${BOLD}gpg --full-generate-key${NC}"
+    read -p "Press Enter once you have completed the GPG setup to continue..."
+done
+echo -e "${GREEN}✓ GPG key found.${NC}"
 
 echo -e "Please enter the ${BOLD}Email Address${NC} associated with your GPG key."
 read -p "GPG Email: " GPG_EMAIL
