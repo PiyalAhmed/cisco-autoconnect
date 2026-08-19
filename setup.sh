@@ -109,12 +109,16 @@ install_dependency() {
     if ! command -v "$command_to_check" &> /dev/null; then
         echo -e "${YELLOW}$package is missing.${NC}"
         read -p "Would you like to install it via Homebrew? (y/n): " choice
-        case "$choice" in 
-            y|Y ) 
-                if [ -n "$tap" ]; then brew tap "$tap" >/dev/null 2>&1; fi
+        case "$choice" in
+            y|Y )
+                if [ -n "$tap" ]; then brew tap "$tap"; fi
                 brew install "$package"
+                if ! command -v "$command_to_check" &> /dev/null; then
+                    echo -e "${RED}Error: $package installation did not produce a working '$command_to_check' command. Exiting.${NC}"
+                    exit 1
+                fi
                 ;;
-            * ) 
+            * )
                 echo -e "${RED}Cannot proceed without $package. Exiting.${NC}"
                 exit 1
                 ;;
@@ -298,9 +302,14 @@ echo -e "${BOLD}Biometric Security${NC}"
 read -p "Do you want to require Touch ID to connect to the VPN? (y/n): " TOUCH_ID_CHOICE
 
 if [[ "$TOUCH_ID_CHOICE" =~ ^[Yy]$ ]]; then
-    echo "pinentry-program $BREW_PREFIX/bin/pinentry-touchid" > "$GPG_AGENT_CONF"
-    gpgconf --kill gpg-agent
-    echo -e "${GREEN}✓ Touch ID enabled.${NC}\n"
+    if [ ! -x "$BREW_PREFIX/bin/pinentry-touchid" ]; then
+        echo -e "${RED}Error: pinentry-touchid is not installed at $BREW_PREFIX/bin/pinentry-touchid.${NC}"
+        echo -e "${RED}Keeping the standard pinentry-mac prompt instead.${NC}\n"
+    else
+        echo "pinentry-program $BREW_PREFIX/bin/pinentry-touchid" > "$GPG_AGENT_CONF"
+        gpgconf --kill gpg-agent
+        echo -e "${GREEN}✓ Touch ID enabled.${NC}\n"
+    fi
 else
     echo -e "${GREEN}✓ Standard password prompt maintained.${NC}\n"
 fi
