@@ -1,9 +1,17 @@
 #!/bin/bash
 
-# Prevent macOS from sleeping and terminating the session during setup
+# Prevent macOS from sleeping and terminating the session during setup.
+# NOTE: We intentionally do NOT `exec caffeinate -i "$0" "$@"` here. When this
+# script is run via `bash -c "$(curl -fsSL ...)"` (our own documented install
+# command), $0 is just the literal string "bash", not a path to this script -
+# so an exec-based re-launch replaces this process with a bare interactive
+# bash shell instead of continuing setup. Running caffeinate in the
+# background, pinned to our own PID, keeps the machine awake without
+# depending on $0 at all, so it works the same via curl|bash, ./setup.sh, or
+# bash setup.sh.
 if [[ -z "$CAFFEINATED" ]]; then
     export CAFFEINATED=1
-    exec caffeinate -i "$0" "$@"
+    caffeinate -i -w $$ &
 fi
 
 # ==============================================================================
@@ -90,77 +98,153 @@ echo -e "${BOLD}${BLUE}====================================================${NC}
 echo -e "${BOLD}${BLUE}   Cisco AnyConnect CLI Auto-Connect Setup        ${NC}"
 echo -e "${BOLD}${BLUE}====================================================${NC}\n"
 
-# --- 1. Dependency Checks ---
-echo -e "${BOLD}Checking dependencies...${NC}"
+# --- 0. Cisco Client Check ---
+# This tool automates the Cisco VPN CLI - it doesn't install it. Check for it
+# up front so a missing client fails fast with a clear message, instead of
+# the whole wizard completing successfully and only failing later at `vpn -c`.
+# Checks both the legacy AnyConnect path and the newer rebranded "Cisco
+# Secure Client" path.
+CISCO_VPN_CLI=""
+for candidate in "/opt/cisco/anyconnect/bin/vpn" "/opt/cisco/secureclient/bin/vpn"; do
+    if [ -x "$candidate" ]; then
+        CISCO_VPN_CLI="$candidate"
+        break
+    fi
+done
 
-if ! command -v brew &> /dev/null; then
-    echo -e "${RED}Homebrew is not installed. Please install Homebrew first and run this script again.${NC}"
+if [ -z "$CISCO_VPN_CLI" ]; then
+    echo -e "${RED}Cisco AnyConnect / Cisco Secure Client CLI was not found at:${NC}"
+    echo -e "  /opt/cisco/anyconnect/bin/vpn"
+    echo -e "  /opt/cisco/secureclient/bin/vpn"
+    echo -e "${RED}Install the Cisco AnyConnect / Cisco Secure Mobility Client from your organization first, then re-run this script.${NC}"
     exit 1
+fi
+echo -e "${GREEN}✓ Cisco VPN client found at $CISCO_VPN_CLI${NC}\n"
+
+# --- 1. Biometric Preference ---
+# Asked up front (before we install anything) so we only pull in
+# pinentry-touchid when it's actually wanted, and fall back to plain
+# password-based GPG encryption (pinentry-mac) otherwise.
+echo -e "${BOLD}Biometric Security${NC}"
+echo "Touch ID lets you approve VPN connections with your fingerprint instead of"
+echo "typing your GPG passphrase every time."
+read -p "Use Touch ID? (Y/n, recommended): " TOUCH_ID_CHOICE
+TOUCH_ID_CHOICE=${TOUCH_ID_CHOICE:-y}
+echo ""
+
+# --- 2. Dependency Scan ---
+# Scan first, based on the Touch ID choice above, then show the user exactly
+# what's already present and what's missing, and ask ONE yes/no to install
+# everything that's missing - no per-package prompts.
+echo -e "${BOLD}Scanning dependencies...${NC}"
+
+NEED_BREW=0
+if ! command -v brew &> /dev/null; then
+    NEED_BREW=1
+fi
+
+PRESENT_NAMES=()
+MISSING_NAMES=()
+MISSING_PACKAGES=()
+MISSING_TAPS=()
+
+check_dep() {
+    local name=$1 package=$2 command_to_check=$3 tap=$4
+    if command -v "$command_to_check" &> /dev/null; then
+        PRESENT_NAMES+=("$name")
+    else
+        MISSING_NAMES+=("$name")
+        MISSING_PACKAGES+=("$package")
+        MISSING_TAPS+=("$tap")
+    fi
+}
+
+check_dep "GnuPG" "gnupg" "gpg" ""
+check_dep "OATH Toolkit" "oath-toolkit" "oathtool" ""
+check_dep "pinentry-mac" "pinentry-mac" "pinentry-mac" ""
+if [[ "$TOUCH_ID_CHOICE" =~ ^[Yy]$ ]]; then
+    check_dep "pinentry-touchid" "pinentry-touchid" "pinentry-touchid" "jorgelbg/tap"
+fi
+
+if command -v python3 &> /dev/null; then
+    PRESENT_NAMES+=("Python (python3)")
+elif command -v python &> /dev/null; then
+    PRESENT_NAMES+=("Python")
+else
+    MISSING_NAMES+=("Python")
+    MISSING_PACKAGES+=("python")
+    MISSING_TAPS+=("")
+fi
+
+echo ""
+if [ ${#PRESENT_NAMES[@]} -gt 0 ]; then
+    echo -e "${GREEN}Already installed:${NC}"
+    for n in "${PRESENT_NAMES[@]}"; do echo -e "  ${GREEN}✓${NC} $n"; done
+fi
+
+if [ "$NEED_BREW" -eq 1 ] || [ ${#MISSING_NAMES[@]} -gt 0 ]; then
+    echo -e "${YELLOW}Will be installed:${NC}"
+    [ "$NEED_BREW" -eq 1 ] && echo -e "  ${YELLOW}•${NC} Homebrew (package manager)"
+    for n in "${MISSING_NAMES[@]}"; do echo -e "  ${YELLOW}•${NC} $n"; done
+    echo ""
+    read -p "Proceed with installing the above? (Y/n): " INSTALL_CONFIRM
+    INSTALL_CONFIRM=${INSTALL_CONFIRM:-y}
+    if [[ ! "$INSTALL_CONFIRM" =~ ^[Yy]$ ]]; then
+        echo -e "${RED}Cannot proceed without these dependencies. Exiting.${NC}"
+        exit 1
+    fi
+else
+    echo -e "${GREEN}✓ All dependencies already satisfied.${NC}"
+fi
+echo ""
+
+# --- Dependency Install ---
+if [ "$NEED_BREW" -eq 1 ]; then
+    echo -e "${YELLOW}Installing Homebrew (its installer will prompt for confirmation/sudo itself)...${NC}"
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+    if [[ -x /opt/homebrew/bin/brew ]]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+    elif [[ -x /usr/local/bin/brew ]]; then
+        eval "$(/usr/local/bin/brew shellenv)"
+    fi
+
+    if ! command -v brew &> /dev/null; then
+        echo -e "${RED}Homebrew installation did not complete. Please install it manually and re-run this script.${NC}"
+        exit 1
+    fi
 fi
 
 BREW_PREFIX=$(brew --prefix)
 OATHTOOL_PATH="$BREW_PREFIX/bin/oathtool"
 
-install_dependency() {
-    local package=$1
-    local command_to_check=$2
-    local tap=$3
+for i in "${!MISSING_PACKAGES[@]}"; do
+    echo -e "${YELLOW}Installing ${MISSING_NAMES[$i]}...${NC}"
+    [ -n "${MISSING_TAPS[$i]}" ] && brew tap "${MISSING_TAPS[$i]}"
+    brew install "${MISSING_PACKAGES[$i]}"
+done
 
-    if ! command -v "$command_to_check" &> /dev/null; then
-        echo -e "${YELLOW}$package is missing.${NC}"
-        read -p "Would you like to install it via Homebrew? (y/n): " choice
-        case "$choice" in
-            y|Y )
-                if [ -n "$tap" ]; then brew tap "$tap"; fi
-                brew install "$package"
-                if ! command -v "$command_to_check" &> /dev/null; then
-                    echo -e "${RED}Error: $package installation did not produce a working '$command_to_check' command. Exiting.${NC}"
-                    exit 1
-                fi
-                ;;
-            * )
-                echo -e "${RED}Cannot proceed without $package. Exiting.${NC}"
-                exit 1
-                ;;
-        esac
-    else
-        echo -e "${GREEN}✓ $package is installed.${NC}"
+# Verify the mandatory tools landed (pinentry-touchid is allowed to fail here;
+# step 7 below falls back to the password prompt if it's still missing).
+for cmd in gpg oathtool pinentry-mac; do
+    if ! command -v "$cmd" &> /dev/null; then
+        echo -e "${RED}Error: '$cmd' is still missing after installation. Exiting.${NC}"
+        exit 1
     fi
-}
+done
 
-# --- Dynamic Python Checker ---
-check_python() {
-    if command -v python3 &> /dev/null; then
-        PYTHON_CMD="python3"
-        echo -e "${GREEN}✓ Python is installed ($PYTHON_CMD).${NC}"
-    elif command -v python &> /dev/null; then
-        PYTHON_CMD="python"
-        echo -e "${GREEN}✓ Python is installed ($PYTHON_CMD).${NC}"
-    else
-        echo -e "${YELLOW}Python is missing. It is required to decode Google Authenticator links.${NC}"
-        read -p "Would you like to install it via Homebrew? (y/n): " choice
-        case "$choice" in 
-            y|Y ) 
-                brew install python
-                PYTHON_CMD="python3"
-                ;;
-            * ) 
-                echo -e "${RED}Cannot proceed without Python. Exiting.${NC}"
-                exit 1
-                ;;
-        esac
-    fi
-}
-
-install_dependency "gnupg" "gpg"
-install_dependency "oath-toolkit" "oathtool"
-install_dependency "pinentry-mac" "pinentry-mac"
-install_dependency "pinentry-touchid" "pinentry-touchid" "jorgelbg/tap"
-check_python
+if command -v python3 &> /dev/null; then
+    PYTHON_CMD="python3"
+elif command -v python &> /dev/null; then
+    PYTHON_CMD="python"
+else
+    echo -e "${RED}Error: Python is still missing after installation. Exiting.${NC}"
+    exit 1
+fi
 
 echo ""
 
-# --- 2. GPG Key Check ---
+# --- 3. GPG Key Check ---
 echo -e "${BOLD}Configuring Encryption...${NC}"
 while ! gpg --list-secret-keys 2>/dev/null | grep -q "^sec"; do
     echo -e "${YELLOW}No GPG secret key found.${NC}"
@@ -180,7 +264,7 @@ gpgconf --kill gpg-agent
 
 echo ""
 
-# --- 3. Configuration & Credentials ---
+# --- 4. Configuration & Credentials ---
 echo -e "${BOLD}Configuring VPN Profile...${NC}"
 read -p "Desired Terminal Command Name (e.g., vpn): " CMD_NAME
 CMD_NAME=${CMD_NAME:-vpn}
@@ -250,15 +334,23 @@ while true; do
         continue
     fi
 
-    echo -e "${YELLOW}Please open your Authenticator app and find the current 6-digit code for this VPN.${NC}"
-    read -p "Press [Enter] when you are looking at it..."
+    echo -e "${YELLOW}Open your Authenticator app and compare it against the live code below.${NC}"
+    echo -e "${YELLOW}Press [Enter] once you're ready to confirm.${NC}\n"
 
-    # Re-generate the token instantly so it doesn't expire during the wait
-    TEST_TOKEN=$("$OATHTOOL_PATH" --totp -b "$TOTP_SECRET" 2>/dev/null)
+    # Live countdown display: regenerate the token every second and redraw in
+    # place, so the code on screen tracks the real TOTP window instead of
+    # being a single snapshot that can go stale while the user looks away.
+    while true; do
+        REMAINING=$(( 30 - ($(date +%s) % 30) ))
+        LIVE_TOKEN=$("$OATHTOOL_PATH" --totp -b "$TOTP_SECRET" 2>/dev/null)
+        printf "\r  ${BOLD}${GREEN}%s${NC}   ${YELLOW}(refreshes in %2ds)${NC}   " "$LIVE_TOKEN" "$REMAINING"
+        if read -t 1 -n 1 -s _; then
+            break
+        fi
+    done
+    printf "\n\n"
 
-    echo -e "Live 6-digit code generated: ${BOLD}${GREEN}$TEST_TOKEN${NC}"
-    echo -e "${YELLOW}(Note: Codes change every 30 seconds. If it just changed on your phone, wait a moment to see if they match.)${NC}"
-    read -p "Does this match the code currently shown in your Authenticator app? (y/n): " OTP_CONFIRM
+    read -p "Does that match the code currently shown in your Authenticator app? (y/n): " OTP_CONFIRM
 
     if [[ "$OTP_CONFIRM" =~ ^[Yy]$ ]]; then
         echo -e "${GREEN}✓ OTP verification successful! Proceeding with encryption...${NC}\n"
@@ -268,7 +360,7 @@ while true; do
     fi
 done
 
-# --- 4. Encrypt Credentials ---
+# --- 5. Encrypt Credentials ---
 CREDS_FILE="$HOME/.${CMD_NAME}-creds.gpg"
 
 cat <<EOF > /tmp/vpn-creds-tmp.txt
@@ -281,7 +373,7 @@ rm -P /tmp/vpn-creds-tmp.txt 2>/dev/null || rm /tmp/vpn-creds-tmp.txt
 
 echo -e "${GREEN}✓ Credentials encrypted and saved to $CREDS_FILE${NC}\n"
 
-# --- 5. Initial Keychain Handshake ---
+# --- 6. Initial Keychain Handshake ---
 echo -e "${BOLD}Initial Keychain Setup${NC}"
 echo "We need to save your GPG password to the macOS Keychain so the automation works."
 echo -e "${YELLOW}A standard Mac password prompt will appear in a moment.${NC}"
@@ -297,9 +389,9 @@ else
     exit 1
 fi
 
-# --- 6. Touch ID Setup ---
+# --- 7. Touch ID Activation ---
+# (Preference was already collected in step 1, before dependencies were installed.)
 echo -e "${BOLD}Biometric Security${NC}"
-read -p "Do you want to require Touch ID to connect to the VPN? (y/n): " TOUCH_ID_CHOICE
 
 if [[ "$TOUCH_ID_CHOICE" =~ ^[Yy]$ ]]; then
     if [ ! -x "$BREW_PREFIX/bin/pinentry-touchid" ]; then
@@ -314,7 +406,7 @@ else
     echo -e "${GREEN}✓ Standard password prompt maintained.${NC}\n"
 fi
 
-# --- 7. Generate the CLI Tool ---
+# --- 8. Generate the CLI Tool ---
 echo -e "${BOLD}Generating CLI Tool...${NC}"
 TARGET_BIN="/usr/local/bin/$CMD_NAME"
 
@@ -324,7 +416,7 @@ cat <<EOF > "/tmp/$CMD_NAME"
 # Auto-generated by VPN CLI Setup
 USERNAME="$VPN_USER"
 VPN_SERVER="$VPN_SERVER"
-VPN_CLI="/opt/cisco/anyconnect/bin/vpn"
+VPN_CLI="$CISCO_VPN_CLI"
 OATHTOOL="$OATHTOOL_PATH"
 CREDS_FILE="$CREDS_FILE"
 GPG_EMAIL="$GPG_EMAIL"
@@ -416,6 +508,12 @@ show_help() {
     echo "  -u    Update VPN password"
     echo "  -h    Show this help message"
 }
+
+if [ "\$1" != "-h" ] && [ ! -x "\$VPN_CLI" ]; then
+    echo "Error: Cisco VPN client not found at \$VPN_CLI."
+    echo "It may have been uninstalled or moved. Re-run setup.sh to detect its new location."
+    exit 1
+fi
 
 case "\$1" in
     -c) connect_vpn ;;
